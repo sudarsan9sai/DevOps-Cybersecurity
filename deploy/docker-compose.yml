@@ -1,0 +1,138 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# INVESTWISE — Docker Compose for Local Development
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# Services:
+#   1. api        — Node.js backend (Express + TypeScript)
+#   2. client     — React frontend (Vite dev server with HMR)
+#   3. postgres   — PostgreSQL 15 (primary database)
+#   4. redis      — Redis 7 (cache, sessions, Bull queues)
+#
+# Usage:
+#   docker-compose up -d          # Start all services
+#   docker-compose logs -f api    # Follow backend logs
+#   docker-compose down           # Stop all services
+#   docker-compose down -v        # Stop + delete volumes (wipes DB)
+#
+# Ports:
+#   3001  — API (http://localhost:3001)
+#   5173  — Frontend (http://localhost:5173)
+#   5432  — PostgreSQL
+#   6379  — Redis
+# ═══════════════════════════════════════════════════════════════════════════════
+
+version: '3.8'
+
+services:
+  # ── PostgreSQL Database ──────────────────────────────────────────────────
+  # Primary data store for users, orders, holdings, audit logs.
+  # Data persisted in named volume to survive container restarts.
+  postgres:
+    image: postgres:15-alpine
+    container_name: investwise-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: investwise
+      POSTGRES_PASSWORD: investwise_dev_password_2024
+      POSTGRES_DB: investwise
+      # Tune for development (not production settings)
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=en_US.UTF-8"
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U investwise -d investwise"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ── Redis Cache & Queue ────────────────────────────────────────────────
+  # Used for:
+  #   1. Session storage (JWT refresh tokens)
+  #   2. Cache (portfolio data with 15-min TTL during market hours)
+  #   3. Rate limiting counters
+  #   4. Bull job queues (SIP processing, notifications)
+  #   5. Idempotency key store
+  redis:
+    image: redis:7-alpine
+    container_name: investwise-redis
+    restart: unless-stopped
+    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ── Backend API ──────────────────────────────────────────────────────────
+  # Express + TypeScript server with hot-reload via ts-node-dev.
+  # Connects to PostgreSQL and Redis.
+  api:
+    build:
+      context: ./server
+      dockerfile: Dockerfile.dev
+    container_name: investwise-api
+    restart: unless-stopped
+    ports:
+      - "3001:3001"
+    environment:
+      NODE_ENV: development
+      PORT: 3001
+      # Database
+      DATABASE_URL: postgresql://investwise:investwise_dev_password_2024@postgres:5432/investwise?schema=public
+      # Redis
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      # JWT
+      JWT_SECRET: dev-jwt-secret-change-in-production-2024
+      JWT_REFRESH_SECRET: dev-refresh-secret-change-in-production-2024
+      JWT_EXPIRES_IN: 15m
+      JWT_REFRESH_EXPIRES_IN: 7d
+      # Encryption
+      ENCRYPTION_KEY: 0123456789abcdef0123456789abcdef
+      # BSE StarMF (stub)
+      BSE_MEMBER_CODE: DEMO_BSE
+      BSE_API_URL: https://bsestarmf.in/starmfwebapi/mock
+      # Razorpay (test mode)
+      RAZORPAY_KEY_ID: rzp_test_xxxxxxxxxxxx
+      RAZORPAY_KEY_SECRET: xxxxxxxxxxxxxxxxxxxx
+    volumes:
+      - ./server/src:/app/src                  # Hot reload source files
+      - /app/node_modules                      # Prevent overwrite of container modules
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: npx ts-node-dev --respawn --transpile-only src/main.ts
+
+  # ── Frontend (Vite Dev Server) ─────────────────────────────────────────
+  # React 18 + TypeScript + Tailwind CSS with Vite HMR.
+  # Proxies /api/* requests to the backend service.
+  client:
+    build:
+      context: ./client
+      dockerfile: Dockerfile.dev
+    container_name: investwise-client
+    restart: unless-stopped
+    ports:
+      - "5173:5173"
+    environment:
+      VITE_API_URL: http://api:3001
+    volumes:
+      - ./client/src:/app/src                  # Hot reload source files
+      - /app/node_modules
+    depends_on:
+      - api
+    command: npx vite --host 0.0.0.0
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local

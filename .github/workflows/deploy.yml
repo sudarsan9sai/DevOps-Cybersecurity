@@ -1,0 +1,324 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# INVESTWISE — CI/CD Pipeline (GitHub Actions)
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# Pipeline stages:
+#   1. LINT      — ESLint + Prettier check on frontend and backend
+#   2. TEST      — Jest unit tests + Playwright E2E tests
+#   3. BUILD     — Docker images for API and Client
+#   4. DEPLOY    — Push images to ECR, deploy to ECS Fargate
+#
+# Triggers:
+#   - Push to `main` → Deploy to STAGING
+#   - Push tag `v*`  → Deploy to PRODUCTION
+#   - Pull request   → Lint + Test only (no deploy)
+#
+# SECURITY:
+#   - Secrets stored in GitHub Secrets (never in code)
+#   - Docker images scanned with Trivy for vulnerabilities
+#   - OIDC-based AWS authentication (no long-lived keys)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+name: InvestWise CI/CD
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+
+env:
+  AWS_REGION: ap-south-1                      # Mumbai (closest to Indian users)
+  ECR_REGISTRY: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.ap-south-1.amazonaws.com
+  API_IMAGE: investwise-api
+  CLIENT_IMAGE: investwise-client
+  ECS_CLUSTER: investwise-cluster
+
+permissions:
+  id-token: write                             # OIDC for AWS auth
+  contents: read
+
+jobs:
+  # ── Stage 1: Lint ────────────────────────────────────────────────────────
+  lint:
+    name: 🔍 Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: |
+            server/package-lock.json
+            client/package-lock.json
+
+      - name: Install backend dependencies
+        run: cd server && npm ci
+
+      - name: Install frontend dependencies
+        run: cd client && npm ci
+
+      - name: Lint backend
+        run: cd server && npx eslint src --ext .ts --max-warnings=0
+
+      - name: Lint frontend
+        run: cd client && npx eslint src --ext .ts,.tsx --max-warnings=0
+
+      - name: Check TypeScript (backend)
+        run: cd server && npx tsc --noEmit
+
+      - name: Check TypeScript (frontend)
+        run: cd client && npx tsc --noEmit
+
+  # ── Stage 2: Test ────────────────────────────────────────────────────────
+  test:
+    name: 🧪 Test
+    runs-on: ubuntu-latest
+    needs: lint
+    services:
+      # PostgreSQL for integration tests
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_USER: investwise
+          POSTGRES_PASSWORD: test_password
+          POSTGRES_DB: investwise_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      # Redis for cache/queue tests
+      redis:
+        image: redis:7-alpine
+        ports: ['6379:6379']
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: server/package-lock.json
+
+      - name: Install backend dependencies
+        run: cd server && npm ci
+
+      - name: Run Prisma migrations
+        run: cd server && npx prisma db push
+        env:
+          DATABASE_URL: postgresql://investwise:test_password@localhost:5432/investwise_test
+
+      - name: Run unit tests
+        run: cd server && npx jest --coverage --forceExit
+        env:
+          DATABASE_URL: postgresql://investwise:test_password@localhost:5432/investwise_test
+          REDIS_HOST: localhost
+          JWT_SECRET: test-jwt-secret
+          JWT_REFRESH_SECRET: test-refresh-secret
+          ENCRYPTION_KEY: 0123456789abcdef0123456789abcdef
+
+      - name: Upload coverage
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: server/coverage/
+
+  # ── Stage 2b: E2E Tests ─────────────────────────────────────────────────
+  e2e:
+    name: 🎭 E2E Tests
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install backend dependencies
+        run: cd server && npm ci
+
+      - name: Install frontend dependencies
+        run: cd client && npm ci
+
+      - name: Install Playwright browsers
+        run: cd server && npx playwright install --with-deps chromium
+
+      - name: Start backend
+        run: cd server && npx ts-node-dev --transpile-only src/main.ts &
+        env:
+          PORT: 3001
+          JWT_SECRET: test-jwt-secret
+          JWT_REFRESH_SECRET: test-refresh-secret
+          ENCRYPTION_KEY: 0123456789abcdef0123456789abcdef
+
+      - name: Start frontend
+        run: cd client && npx vite --port 5173 &
+
+      - name: Wait for servers
+        run: sleep 10
+
+      - name: Run E2E tests
+        run: cd server && npx playwright test src/__tests__/e2e/
+
+      - name: Upload E2E results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-results
+          path: server/playwright-report/
+
+  # ── Stage 3: Build Docker Images ────────────────────────────────────────
+  build:
+    name: 🐳 Build & Push
+    runs-on: ubuntu-latest
+    needs: [test, e2e]
+    if: github.event_name == 'push'           # Only on push (not PRs)
+    steps:
+      - uses: actions/checkout@v4
+
+      # Authenticate with AWS via OIDC (no long-lived credentials)
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set image tag
+        id: tag
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            echo "TAG=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+            echo "ENV=production" >> $GITHUB_OUTPUT
+          else
+            echo "TAG=staging-$(echo ${{ github.sha }} | head -c 7)" >> $GITHUB_OUTPUT
+            echo "ENV=staging" >> $GITHUB_OUTPUT
+          fi
+
+      # ── Build API Image ──
+      - name: Build API image
+        run: |
+          docker build -f server/Dockerfile \
+            -t ${{ env.ECR_REGISTRY }}/${{ env.API_IMAGE }}:${{ steps.tag.outputs.TAG }} \
+            -t ${{ env.ECR_REGISTRY }}/${{ env.API_IMAGE }}:latest \
+            ./server
+
+      # ── Scan API image for vulnerabilities ──
+      - name: Scan API image
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.ECR_REGISTRY }}/${{ env.API_IMAGE }}:${{ steps.tag.outputs.TAG }}
+          format: table
+          exit-code: 1                         # Fail on CRITICAL/HIGH vulnerabilities
+          severity: CRITICAL,HIGH
+
+      # ── Build Client Image ──
+      - name: Build Client image
+        run: |
+          docker build -f client/Dockerfile \
+            -t ${{ env.ECR_REGISTRY }}/${{ env.CLIENT_IMAGE }}:${{ steps.tag.outputs.TAG }} \
+            -t ${{ env.ECR_REGISTRY }}/${{ env.CLIENT_IMAGE }}:latest \
+            ./client
+
+      # ── Push Images ──
+      - name: Push images to ECR
+        run: |
+          docker push ${{ env.ECR_REGISTRY }}/${{ env.API_IMAGE }}:${{ steps.tag.outputs.TAG }}
+          docker push ${{ env.ECR_REGISTRY }}/${{ env.API_IMAGE }}:latest
+          docker push ${{ env.ECR_REGISTRY }}/${{ env.CLIENT_IMAGE }}:${{ steps.tag.outputs.TAG }}
+          docker push ${{ env.ECR_REGISTRY }}/${{ env.CLIENT_IMAGE }}:latest
+
+  # ── Stage 4: Deploy to ECS ──────────────────────────────────────────────
+  deploy:
+    name: 🚀 Deploy
+    runs-on: ubuntu-latest
+    needs: build
+    # Deploy staging on main push, production on tag
+    environment:
+      name: ${{ startsWith(github.ref, 'refs/tags/v') && 'production' || 'staging' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set image tag
+        id: tag
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            echo "TAG=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+            echo "SERVICE_SUFFIX=prod" >> $GITHUB_OUTPUT
+          else
+            echo "TAG=staging-$(echo ${{ github.sha }} | head -c 7)" >> $GITHUB_OUTPUT
+            echo "SERVICE_SUFFIX=staging" >> $GITHUB_OUTPUT
+          fi
+
+      # ── Update ECS Service with New Image ──
+      # Uses rolling deployment (min 50% healthy, max 200%) for zero-downtime
+      - name: Deploy API to ECS
+        run: |
+          aws ecs update-service \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --service investwise-api-${{ steps.tag.outputs.SERVICE_SUFFIX }} \
+            --force-new-deployment \
+            --deployment-configuration "minimumHealthyPercent=50,maximumPercent=200"
+
+      - name: Deploy Client to ECS
+        run: |
+          aws ecs update-service \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --service investwise-client-${{ steps.tag.outputs.SERVICE_SUFFIX }} \
+            --force-new-deployment
+
+      # ── Wait for Deployment ──
+      - name: Wait for API deployment
+        run: |
+          aws ecs wait services-stable \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --services investwise-api-${{ steps.tag.outputs.SERVICE_SUFFIX }}
+
+      # ── Health Check ──
+      - name: Verify deployment health
+        run: |
+          if [[ "${{ steps.tag.outputs.SERVICE_SUFFIX }}" == "prod" ]]; then
+            URL="https://api.investwise.in/api/health"
+          else
+            URL="https://api-staging.investwise.in/api/health"
+          fi
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" $URL)
+          if [ "$STATUS" != "200" ]; then
+            echo "❌ Health check failed with status $STATUS"
+            exit 1
+          fi
+          echo "✅ Deployment healthy"
+
+      # ── Notify Team ──
+      - name: Notify Slack
+        if: always()
+        uses: 8398a7/action-slack@v3
+        with:
+          status: ${{ job.status }}
+          text: |
+            InvestWise ${{ steps.tag.outputs.SERVICE_SUFFIX }} deployment
+            Tag: ${{ steps.tag.outputs.TAG }}
+            Status: ${{ job.status }}
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}

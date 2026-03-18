@@ -1,0 +1,681 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// INVESTWISE — PRISMA DATABASE SCHEMA
+// SEBI-Regulated Retail Investment Platform
+//
+// REGULATORY NOTES:
+//   - SEBI KRA (Know Your Customer Registration Agency): PAN is mandatory
+//   - SEBI AML Norms: Re-KYC required every 2 years
+//   - AMFI Registration: ARN code tracked on every MF transaction
+//   - RBI Payment Aggregator Guidelines: Payment logs retained 10 years
+//   - DPDPA 2023: Consent tracking for all data processing
+//   - Immutable audit trail: 7-year retention (SEBI Circular SEBI/HO/MIRSD/2018)
+//
+// SECURITY NOTES:
+//   - PII fields (aadhaar, pan, bankAccount) are encrypted at rest (AES-256-GCM)
+//   - Sensitive fields redacted in all log outputs
+//   - UUIDs used as primary keys to prevent enumeration attacks
+// ═══════════════════════════════════════════════════════════════════════════════
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ── ENUMS ────────────────────────────────────────────────────────────────────
+
+// KYC status tracks the multi-step verification journey
+// SEBI mandates full KYC before any order can be placed
+enum KycStatus {
+  NOT_STARTED       // User just registered, no KYC initiated
+  PAN_VERIFIED      // PAN validated against NSDL/CDSL records
+  AADHAAR_VERIFIED  // Aadhaar verified via DigiLocker / UIDAI
+  VIDEO_SUBMITTED   // Video KYC recording submitted for review
+  VIDEO_REVIEW      // Under manual/AI review (SEBI video KYC guidelines)
+  APPROVED          // Fully KYC-compliant, can transact
+  REJECTED          // KYC failed, requires re-submission
+  EXPIRED           // Past 2-year re-KYC deadline (SEBI mandate)
+}
+
+// Order statuses reflect BSE StarMF integration lifecycle
+enum OrderStatus {
+  PENDING           // Created locally, not yet sent to BSE
+  PAYMENT_PENDING   // Awaiting payment confirmation from Razorpay
+  SUBMITTED         // Submitted to BSE StarMF API
+  CONFIRMED         // BSE acknowledged, units allotment pending
+  ALLOTTED          // Units allotted by AMC, NAV applied
+  REJECTED          // BSE/AMC rejected the order
+  CANCELLED         // User cancelled before submission
+  FAILED            // Technical failure (circuit breaker tripped etc.)
+}
+
+enum OrderType {
+  LUMPSUM           // One-time purchase
+  SIP               // Systematic Investment Plan installment
+  REDEMPTION        // Sell/redeem units
+  SWITCH            // Switch between schemes (same AMC)
+  STP               // Systematic Transfer Plan
+}
+
+enum SipStatus {
+  ACTIVE            // Currently running, will execute on SIP date
+  PAUSED            // Temporarily paused by user
+  COMPLETED         // Reached total installments or end date
+  CANCELLED         // Permanently cancelled by user
+  FAILED            // Payment mandate failed repeatedly
+}
+
+enum PaymentStatus {
+  INITIATED         // Payment request created
+  PROCESSING        // Razorpay webhook received, processing
+  SUCCESS           // Payment confirmed and settled
+  FAILED            // Payment failed (insufficient funds, timeout)
+  REFUNDED          // Full refund processed
+  PARTIAL_REFUND    // Partial refund (e.g., cancelled order partial)
+}
+
+enum PaymentMethod {
+  UPI               // UPI Collect / Intent (most popular in India)
+  NET_BANKING       // NEFT/IMPS/RTGS via bank redirect
+  NACH              // Auto-debit mandate for SIPs
+  WALLET            // Future: Paytm, PhonePe wallet
+}
+
+// Risk classification per SEBI mandate (Riskometer regulation)
+enum RiskLevel {
+  LOW
+  LOW_TO_MODERATE
+  MODERATE
+  MODERATELY_HIGH
+  HIGH
+  VERY_HIGH
+}
+
+// AMFI fund categories (SEBI circular Oct 2017 — scheme categorization)
+enum FundCategory {
+  EQUITY_LARGE_CAP
+  EQUITY_MID_CAP
+  EQUITY_SMALL_CAP
+  EQUITY_MULTI_CAP
+  EQUITY_FLEXI_CAP
+  EQUITY_ELSS        // Tax-saving, 3-year lock-in
+  DEBT_LIQUID
+  DEBT_OVERNIGHT
+  DEBT_CORPORATE
+  DEBT_GILT
+  DEBT_BANKING_PSU
+  HYBRID_AGGRESSIVE
+  HYBRID_BALANCED
+  HYBRID_CONSERVATIVE
+  INDEX_FUND
+  ETF
+  FUND_OF_FUNDS
+  SECTORAL_THEMATIC
+  INTERNATIONAL
+  SOLUTION_RETIREMENT
+  SOLUTION_CHILDREN
+}
+
+enum NotificationType {
+  ORDER_CONFIRMED
+  ORDER_REJECTED
+  SIP_EXECUTED
+  SIP_REMINDER        // Sent 1 day before SIP date
+  SIP_FAILED
+  PAYMENT_SUCCESS
+  PAYMENT_FAILED
+  KYC_APPROVED
+  KYC_REJECTED
+  NAV_UPDATE
+  PRICE_ALERT
+  DIVIDEND_CREDITED
+  ACCOUNT_SECURITY
+  REGULATORY_UPDATE    // SEBI circulars, scheme changes
+}
+
+enum NotificationChannel {
+  IN_APP             // Always delivered
+  PUSH               // Firebase Cloud Messaging
+  SMS                // Twilio (transactional only per TRAI DND rules)
+  EMAIL              // SendGrid
+}
+
+enum ConsentType {
+  DATA_PROCESSING     // Required for platform usage (DPDPA 2023)
+  MARKETING           // Optional, email/SMS marketing
+  ANALYTICS           // Optional, usage analytics
+  THIRD_PARTY_SHARE   // Sharing data with AMCs, RTAs (required for orders)
+  NOMINATION          // Optional, nominee details
+}
+
+enum AlertCondition {
+  ABOVE              // Alert when price > target
+  BELOW              // Alert when price < target
+}
+
+// ── MODELS ───────────────────────────────────────────────────────────────────
+
+/// Core user model. Every field that contains PII is encrypted at rest
+/// using AES-256-GCM (see src/common/encryption.ts).
+/// Email and mobile are indexed for auth lookups.
+model User {
+  id                String    @id @default(uuid())
+  mobile            String    @unique                          // Primary auth identifier (Indian mobile)
+  email             String?   @unique                          // Optional, used for notifications
+  fullName          String?
+  dateOfBirth       DateTime?
+  gender            String?                                    // "M" | "F" | "O" per UIDAI format
+
+  // ── KYC Fields (encrypted at rest) ──
+  panNumber         String?   @unique                          // Encrypted. Format: ABCDE1234F
+  panVerified       Boolean   @default(false)
+  aadhaarNumber     String?                                    // Encrypted. 12-digit UIDAI number
+  aadhaarVerified   Boolean   @default(false)
+  kycStatus         KycStatus @default(NOT_STARTED)
+  kycCompletedAt    DateTime?
+  kycExpiresAt      DateTime?                                  // kycCompletedAt + 2 years (SEBI re-KYC)
+  videoKycUrl       String?                                    // S3 URL to video recording
+
+  // ── DPDPA Compliance ──
+  dataConsentGiven  Boolean   @default(false)
+  consentTimestamp  DateTime?
+
+  // ── Risk Profile (SEBI suitability requirement) ──
+  riskProfile       String?                                    // LOW | MODERATE | HIGH | AGGRESSIVE
+  investmentGoal    String?                                    // WEALTH_CREATION | TAX_SAVING | etc.
+
+  // ── Device & Security ──
+  deviceFingerprint String?                                    // For fraud detection
+  lastLoginAt       DateTime?
+  failedLoginCount  Int       @default(0)
+  isBlocked         Boolean   @default(false)
+
+  // ── Timestamps ──
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  // ── Relations ──
+  bankAccounts      BankAccount[]
+  orders            Order[]
+  sipPlans          SipPlan[]
+  holdings          Holding[]
+  watchlistItems    WatchlistItem[]
+  priceAlerts       PriceAlert[]
+  notifications     Notification[]
+  consents          UserConsent[]
+  refreshTokens     RefreshToken[]
+  auditLogs         AuditLog[]
+
+  @@index([mobile])
+  @@index([email])
+  @@index([panNumber])
+  @@index([kycStatus])
+  @@map("users")
+}
+
+/// Bank accounts linked for payments and redemption credits.
+/// Multiple accounts allowed; one must be marked primary.
+/// IFSC validated against RBI's IFSC directory.
+model BankAccount {
+  id                String    @id @default(uuid())
+  userId            String
+  bankName          String
+  accountNumber     String                                     // Encrypted at rest
+  ifscCode          String                                     // Validated against RBI IFSC master
+  accountHolderName String
+  isPrimary         Boolean   @default(false)
+  isVerified        Boolean   @default(false)                  // Penny-drop verification status
+  mandateId         String?                                    // NACH mandate ID for SIP auto-debit
+  mandateStatus     String?                                    // ACTIVE | PENDING | REVOKED
+
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  user              User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, accountNumber])
+  @@index([userId])
+  @@map("bank_accounts")
+}
+
+/// Refresh tokens for JWT rotation. Old tokens are revoked on rotation
+/// to prevent replay attacks. Stored hashed, never in plaintext.
+model RefreshToken {
+  id                String    @id @default(uuid())
+  userId            String
+  tokenHash         String    @unique                          // SHA-256 hash of the actual token
+  deviceInfo        String?                                    // User-Agent + screen resolution
+  ipAddress         String?
+  expiresAt         DateTime
+  revokedAt         DateTime?                                  // Set when token is rotated or user logs out
+
+  createdAt         DateTime  @default(now())
+
+  user              User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([tokenHash])
+  @@map("refresh_tokens")
+}
+
+/// Mutual fund scheme master data. Sourced from AMFI daily feed.
+/// NAV updated daily after market close (typically by 11 PM IST).
+model Fund {
+  id                String       @id @default(uuid())
+  amfiCode          String       @unique                       // AMFI scheme code (e.g., "120503")
+  isinNumber        String       @unique                       // ISIN for unique identification
+  schemeName        String
+  fundHouse         String                                     // AMC name
+  schemeType        String                                     // "Open Ended" | "Close Ended" | "Interval"
+  category          FundCategory
+  subCategory       String?                                    // E.g., "Large & Mid Cap"
+  riskLevel         RiskLevel
+
+  // ── NAV & Performance ──
+  currentNav        Decimal      @db.Decimal(12, 4)            // Latest NAV (4 decimal precision per SEBI)
+  navDate           DateTime                                   // Date of the NAV
+  return1d          Decimal?     @db.Decimal(8, 4)
+  return1w          Decimal?     @db.Decimal(8, 4)
+  return1m          Decimal?     @db.Decimal(8, 4)
+  return3m          Decimal?     @db.Decimal(8, 4)
+  return6m          Decimal?     @db.Decimal(8, 4)
+  return1y          Decimal?     @db.Decimal(8, 4)
+  return3y          Decimal?     @db.Decimal(8, 4)             // Annualized CAGR
+  return5y          Decimal?     @db.Decimal(8, 4)
+  returnSinceInception Decimal?  @db.Decimal(8, 4)
+
+  // ── Fund Details ──
+  aum               Decimal      @db.Decimal(16, 2)            // Assets Under Management in Crores
+  expenseRatio      Decimal      @db.Decimal(5, 4)             // TER capped per SEBI (max 2.25%)
+  exitLoad          String?                                    // E.g., "1% if redeemed within 1 year"
+  exitLoadDays      Int?                                       // Exit load applicability period
+  fundManagerName   String?
+  benchmarkIndex    String?                                    // E.g., "NIFTY 50 TRI"
+  launchDate        DateTime?
+  minSipAmount      Decimal      @db.Decimal(12, 2)
+  minLumpsumAmount  Decimal      @db.Decimal(12, 2)
+  sipDates          String?                                    // Allowed SIP dates: "1,5,10,15,20,25"
+  lockInPeriod      Int?                                       // In days (ELSS = 1095 days / 3 years)
+
+  // ── BSE StarMF Integration ──
+  bseSchemeCode     String?                                    // BSE StarMF scheme code for order routing
+  bseAllowed        Boolean      @default(true)                // Whether BSE accepts orders for this scheme
+
+  // ── Metadata ──
+  isActive          Boolean      @default(true)
+  createdAt         DateTime     @default(now())
+  updatedAt         DateTime     @updatedAt
+
+  // ── Relations ──
+  navHistory        NavHistory[]
+  orders            Order[]
+  sipPlans          SipPlan[]
+  holdings          Holding[]
+  watchlistItems    WatchlistItem[]
+  priceAlerts       PriceAlert[]
+
+  @@index([category])
+  @@index([riskLevel])
+  @@index([fundHouse])
+  @@index([schemeName])
+  @@index([amfiCode])
+  @@map("funds")
+}
+
+/// Historical NAV data for charting and XIRR calculations.
+/// Populated daily from AMFI/CAMS/KFintech NAV feed.
+model NavHistory {
+  id                String    @id @default(uuid())
+  fundId            String
+  date              DateTime                                   // Only date part used (truncated to midnight)
+  nav               Decimal   @db.Decimal(12, 4)
+
+  fund              Fund      @relation(fields: [fundId], references: [id], onDelete: Cascade)
+
+  @@unique([fundId, date])                                     // One NAV per fund per day
+  @@index([fundId, date(sort: Desc)])                          // Fast lookups for charting
+  @@map("nav_history")
+}
+
+/// Mutual fund orders. Every order is idempotent — duplicate orders with
+/// the same idempotencyKey are rejected. This prevents accidental double
+/// orders on network retries.
+///
+/// REGULATORY: Each order must carry the AMFI ARN code of the distributor.
+/// For direct plans, arnCode = "DIRECT".
+model Order {
+  id                String       @id @default(uuid())
+  userId            String
+  fundId            String
+  sipPlanId         String?                                    // Null for lumpsum, set for SIP installments
+
+  // ── Order Details ──
+  orderType         OrderType
+  status            OrderStatus  @default(PENDING)
+  amount            Decimal      @db.Decimal(16, 2)            // Order amount in INR
+  nav               Decimal?     @db.Decimal(12, 4)            // NAV at which units were allotted
+  units             Decimal?     @db.Decimal(16, 6)            // Units allotted (6 decimal per SEBI)
+  stampDuty         Decimal?     @db.Decimal(12, 4)            // Stamp duty @0.005% (SEBI mandate since Jul 2020)
+
+  // ── Idempotency (prevents duplicate orders on retry) ──
+  idempotencyKey    String       @unique                       // Client-generated UUID sent in request header
+
+  // ── BSE StarMF Integration ──
+  bseOrderId        String?      @unique                       // Order ID returned by BSE StarMF
+  bseOrderStatus    String?                                    // Raw status from BSE
+  bseTransactionId  String?                                    // BSE transaction reference
+
+  // ── Compliance ──
+  arnCode           String       @default("DIRECT")            // AMFI distributor code or "DIRECT"
+  euinCode          String?                                    // Employee Unique Identification Number
+
+  // ── Payment Reference ──
+  paymentId         String?                                    // FK to Payment record
+
+  // ── Timestamps ──
+  orderedAt         DateTime     @default(now())
+  submittedAt       DateTime?                                  // When sent to BSE
+  allottedAt        DateTime?                                  // When units were allotted
+
+  // ── Relations ──
+  user              User         @relation(fields: [userId], references: [id])
+  fund              Fund         @relation(fields: [fundId], references: [id])
+  sipPlan           SipPlan?     @relation(fields: [sipPlanId], references: [id])
+  payment           Payment?     @relation(fields: [paymentId], references: [id])
+
+  @@index([userId, status])
+  @@index([userId, fundId])
+  @@index([status])
+  @@index([orderedAt(sort: Desc)])
+  @@index([idempotencyKey])
+  @@map("orders")
+}
+
+/// SIP (Systematic Investment Plan) configuration.
+/// Bull queue job (`sipProcessor.ts`) runs daily at 6 AM IST,
+/// picks up active SIPs due for execution, creates orders, and
+/// triggers NACH auto-debit.
+model SipPlan {
+  id                  String     @id @default(uuid())
+  userId              String
+  fundId              String
+  status              SipStatus  @default(ACTIVE)
+
+  // ── SIP Configuration ──
+  amount              Decimal    @db.Decimal(12, 2)            // Monthly SIP amount
+  frequency           String     @default("MONTHLY")           // MONTHLY | WEEKLY | QUARTERLY
+  sipDate             Int                                      // Day of month (1-28 to avoid month-end issues)
+  startDate           DateTime                                 // First SIP execution date
+  endDate             DateTime?                                // Optional end date
+  totalInstallments   Int?                                     // Optional total installment count
+  completedInstallments Int      @default(0)
+  failedInstallments  Int        @default(0)
+  consecutiveFailures Int        @default(0)                   // Cancel SIP after 3 consecutive failures
+
+  // ── NACH Mandate ──
+  mandateId           String?                                  // Razorpay/BSE mandate ID
+  mandateStatus       String?                                  // CREATED | APPROVED | REJECTED
+
+  // ── Timestamps ──
+  nextExecutionDate   DateTime                                 // Calculated: next SIP date
+  lastExecutedAt      DateTime?
+  pausedAt            DateTime?
+  cancelledAt         DateTime?
+  createdAt           DateTime   @default(now())
+  updatedAt           DateTime   @updatedAt
+
+  // ── Relations ──
+  user                User       @relation(fields: [userId], references: [id])
+  fund                Fund       @relation(fields: [fundId], references: [id])
+  orders              Order[]
+
+  @@index([userId, status])
+  @@index([nextExecutionDate, status])                         // Critical for SIP processor job
+  @@index([status])
+  @@map("sip_plans")
+}
+
+/// Aggregated holdings per user per fund.
+/// Updated on every order allotment. Used for portfolio dashboard.
+/// XIRR is calculated from the related transactions.
+model Holding {
+  id                String    @id @default(uuid())
+  userId            String
+  fundId            String
+  units             Decimal   @db.Decimal(16, 6)               // Total units held
+  investedAmount    Decimal   @db.Decimal(16, 2)               // Total amount invested (cost basis)
+  currentValue      Decimal   @db.Decimal(16, 2)               // units × currentNav
+  averageNav        Decimal   @db.Decimal(12, 4)               // Weighted average buy NAV
+
+  // ── Calculated Fields (updated on NAV refresh) ──
+  absoluteReturn    Decimal?  @db.Decimal(16, 2)               // currentValue - investedAmount
+  percentReturn     Decimal?  @db.Decimal(8, 4)                // ((current - invested) / invested) * 100
+  dayChange         Decimal?  @db.Decimal(12, 2)               // Change since previous trading day
+  dayChangePercent  Decimal?  @db.Decimal(8, 4)
+  xirr              Decimal?  @db.Decimal(8, 4)                // Annualized return (Newton-Raphson)
+
+  lastNavUpdateAt   DateTime?
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  user              User      @relation(fields: [userId], references: [id])
+  fund              Fund      @relation(fields: [fundId], references: [id])
+  transactions      Transaction[]
+
+  @@unique([userId, fundId])                                   // One holding record per user per fund
+  @@index([userId])
+  @@map("holdings")
+}
+
+/// Individual buy/sell transactions for a holding.
+/// Used for XIRR calculation and tax computation (FIFO/specific lot).
+/// REGULATORY: Capital gains tax computation requires exact transaction history
+/// Short-term: < 1 year for equity MF, < 3 years for debt MF
+/// Long-term: >= thresholds above
+model Transaction {
+  id                String    @id @default(uuid())
+  holdingId         String
+  orderId           String?                                    // Back-reference to the order
+  type              String                                     // "BUY" | "SELL" | "DIVIDEND"
+  amount            Decimal   @db.Decimal(16, 2)
+  units             Decimal   @db.Decimal(16, 6)
+  nav               Decimal   @db.Decimal(12, 4)
+  stampDuty         Decimal?  @db.Decimal(12, 4)
+
+  // ── Tax Fields ──
+  isLongTerm        Boolean?                                   // Equity: > 1yr, Debt: > 3yr
+  stcg              Decimal?  @db.Decimal(12, 2)               // Short-term capital gains (if SELL)
+  ltcg              Decimal?  @db.Decimal(12, 2)               // Long-term capital gains (if SELL)
+
+  executedAt        DateTime  @default(now())
+
+  holding           Holding   @relation(fields: [holdingId], references: [id], onDelete: Cascade)
+
+  @@index([holdingId, executedAt(sort: Desc)])
+  @@map("transactions")
+}
+
+/// Payment records linked to orders.
+/// Every payment is trackable via Razorpay payment_id for reconciliation.
+/// REGULATORY: RBI Payment Aggregator guidelines require 10-year log retention.
+model Payment {
+  id                  String         @id @default(uuid())
+  userId              String
+  amount              Decimal        @db.Decimal(16, 2)
+  currency            String         @default("INR")
+  method              PaymentMethod
+  status              PaymentStatus  @default(INITIATED)
+
+  // ── Razorpay Integration ──
+  razorpayOrderId     String?        @unique                   // Razorpay order_id
+  razorpayPaymentId   String?        @unique                   // Razorpay payment_id (after capture)
+  razorpaySignature   String?                                  // HMAC signature for verification
+
+  // ── Mandate (for SIP auto-debit via NACH) ──
+  mandateId           String?
+  mandateMaxAmount    Decimal?       @db.Decimal(12, 2)        // Max debit amount per cycle
+
+  // ── Bank Reference ──
+  bankReference       String?                                 // UTR / RRN from bank
+  bankAccountId       String?                                  // Which linked account was debited
+
+  // ── Error Details ──
+  failureReason       String?
+  failureCode         String?                                  // Razorpay error code
+
+  // ── Timestamps ──
+  initiatedAt         DateTime       @default(now())
+  processedAt         DateTime?
+  refundedAt          DateTime?
+
+  // ── Relations ──
+  orders              Order[]
+
+  @@index([userId, status])
+  @@index([razorpayOrderId])
+  @@index([razorpayPaymentId])
+  @@index([initiatedAt(sort: Desc)])
+  @@map("payments")
+}
+
+/// Watchlist items — users can watch funds and stocks for easy access.
+model WatchlistItem {
+  id                String    @id @default(uuid())
+  userId            String
+  fundId            String?
+  assetType         String                                     // "MUTUAL_FUND" | "STOCK" | "ETF"
+  assetCode         String                                     // ISIN or ticker symbol
+  assetName         String
+
+  addedAt           DateTime  @default(now())
+
+  user              User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  fund              Fund?     @relation(fields: [fundId], references: [id])
+
+  @@unique([userId, assetCode])                                // No duplicate watchlist entries
+  @@index([userId])
+  @@map("watchlist_items")
+}
+
+/// Price alerts — trigger notification when asset hits target price.
+model PriceAlert {
+  id                String         @id @default(uuid())
+  userId            String
+  fundId            String?
+  assetCode         String
+  assetName         String
+  targetPrice       Decimal        @db.Decimal(16, 4)
+  condition         AlertCondition
+  currentPrice      Decimal?       @db.Decimal(16, 4)
+  isTriggered       Boolean        @default(false)
+  triggeredAt       DateTime?
+
+  createdAt         DateTime       @default(now())
+
+  user              User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  fund              Fund?          @relation(fields: [fundId], references: [id])
+
+  @@index([userId, isTriggered])
+  @@index([isTriggered, condition])                            // For batch alert checking
+  @@map("price_alerts")
+}
+
+/// Multi-channel notification records.
+/// REGULATORY: SEBI requires immediate confirmation of order placement/allotment.
+/// TRAI DND rules: SMS only for transactional, not promotional.
+model Notification {
+  id                String             @id @default(uuid())
+  userId            String
+  type              NotificationType
+  channel           NotificationChannel @default(IN_APP)
+  title             String
+  body              String
+  metadata          Json?                                      // Order details, fund info, etc.
+
+  isRead            Boolean            @default(false)
+  readAt            DateTime?
+  deliveredAt       DateTime?
+  failedAt          DateTime?
+  failureReason     String?
+
+  createdAt         DateTime           @default(now())
+
+  user              User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, isRead, createdAt(sort: Desc)])             // Unread notifications feed
+  @@index([userId, type])
+  @@index([createdAt(sort: Desc)])
+  @@map("notifications")
+}
+
+/// DPDPA 2023 consent tracking. Every data processing activity
+/// must have explicit user consent. Consent can be withdrawn anytime.
+model UserConsent {
+  id                String       @id @default(uuid())
+  userId            String
+  consentType       ConsentType
+  isGranted         Boolean      @default(false)
+  grantedAt         DateTime?
+  revokedAt         DateTime?
+  version           String       @default("1.0")               // Consent policy version
+  ipAddress         String?                                    // IP at time of consent
+
+  createdAt         DateTime     @default(now())
+  updatedAt         DateTime     @updatedAt
+
+  user              User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, consentType])                              // One record per consent type per user
+  @@index([userId])
+  @@map("user_consents")
+}
+
+/// Immutable audit log. Every financial transaction, KYC event, and
+/// security event is logged. Entries are chained with SHA-256 hashes
+/// to detect tampering.
+///
+/// REGULATORY: SEBI mandates 7-year retention for all financial records.
+/// RBI mandates 10-year retention for payment records.
+model AuditLog {
+  id                String    @id @default(uuid())
+  userId            String?
+  action            String                                     // "ORDER_PLACED", "KYC_VERIFIED", etc.
+  module            String                                     // "auth", "fund", "payment", etc.
+  details           Json                                       // Sanitized details (PII redacted)
+  ipAddress         String?
+  userAgent         String?
+
+  // ── Tamper Detection ──
+  previousHash      String?                                    // SHA-256 of previous log entry
+  currentHash       String                                     // SHA-256 of this entry
+  arnCode           String?                                    // AMFI ARN code for MF transactions
+
+  createdAt         DateTime  @default(now())
+
+  user              User?     @relation(fields: [userId], references: [id])
+
+  @@index([userId, createdAt(sort: Desc)])
+  @@index([module, action])
+  @@index([createdAt(sort: Desc)])
+  @@map("audit_logs")
+}
+
+/// Notification preferences per user per channel.
+/// Users can opt out of non-mandatory channels.
+/// REGULATORY: Order confirmation notifications are MANDATORY (SEBI).
+model NotificationPreference {
+  id                String              @id @default(uuid())
+  userId            String
+  channel           NotificationChannel
+  isEnabled         Boolean             @default(true)
+  type              NotificationType?                          // Null = all types for this channel
+
+  createdAt         DateTime            @default(now())
+  updatedAt         DateTime            @updatedAt
+
+  @@unique([userId, channel, type])
+  @@map("notification_preferences")
+}

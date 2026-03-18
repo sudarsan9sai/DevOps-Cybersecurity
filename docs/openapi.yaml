@@ -1,0 +1,996 @@
+openapi: 3.0.3
+info:
+  title: InvestWise API
+  version: 1.0.0
+  description: |
+    REST API for InvestWise — a SEBI-regulated retail investment platform.
+    All endpoints return JSON in the format: `{ success: boolean, data?: T, error?: { message, code } }`.
+    Financial amounts use INR. Timestamps are ISO 8601 UTC.
+  contact:
+    name: InvestWise API Support
+    email: api-support@investwise.in
+  license:
+    name: Proprietary
+
+servers:
+  - url: http://localhost:3001/api
+    description: Local development
+  - url: https://api.investwise.in/v1
+    description: Production
+
+tags:
+  - name: Auth
+    description: OTP authentication and session management
+  - name: KYC
+    description: SEBI-mandated KYC verification (PAN, Aadhaar, Video)
+  - name: Funds
+    description: Mutual fund browsing, SIP management, and order placement
+  - name: Portfolio
+    description: Portfolio dashboard, holdings, P&L, and XIRR
+  - name: Payments
+    description: Payment initiation (Razorpay), verification, and history
+  - name: Watchlist
+    description: Watchlist CRUD, price alerts, and asset discovery
+  - name: Notifications
+    description: In-app notifications and delivery preferences
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: JWT access token (15 min expiry). Send as `Authorization: Bearer <token>`.
+
+  schemas:
+    ApiResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        data:
+          type: object
+        error:
+          type: object
+          properties:
+            message:
+              type: string
+            code:
+              type: string
+
+    User:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        mobile: { type: string, example: "+919876543210" }
+        fullName: { type: string }
+        email: { type: string, format: email }
+        kycStatus: { type: string, enum: [NOT_STARTED, PAN_VERIFIED, AADHAAR_VERIFIED, VIDEO_SUBMITTED, APPROVED, REJECTED] }
+
+    Fund:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        amfiCode: { type: string }
+        schemeName: { type: string }
+        fundHouse: { type: string }
+        category: { type: string }
+        riskLevel: { type: string, enum: [LOW, MODERATE, HIGH, VERY_HIGH] }
+        currentNav: { type: number, format: decimal }
+        return1y: { type: number }
+        return3y: { type: number }
+        return5y: { type: number }
+        aum: { type: number }
+        expenseRatio: { type: number }
+        minSipAmount: { type: number }
+        minLumpsumAmount: { type: number }
+        exitLoad: { type: string }
+
+    Order:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        fundId: { type: string }
+        orderType: { type: string, enum: [LUMPSUM, SIP, REDEMPTION] }
+        status: { type: string, enum: [PENDING, PAYMENT_PENDING, SUBMITTED, CONFIRMED, ALLOTTED, REJECTED, CANCELLED, FAILED] }
+        amount: { type: number }
+        nav: { type: number, nullable: true }
+        units: { type: number, nullable: true }
+        idempotencyKey: { type: string }
+        orderedAt: { type: string, format: date-time }
+
+    SipPlan:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        fundId: { type: string }
+        amount: { type: number }
+        sipDate: { type: integer, minimum: 1, maximum: 28 }
+        frequency: { type: string, enum: [MONTHLY, WEEKLY, QUARTERLY] }
+        status: { type: string, enum: [ACTIVE, PAUSED, COMPLETED, CANCELLED] }
+        nextExecutionDate: { type: string, format: date }
+        completedInstallments: { type: integer }
+
+    Holding:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        fundId: { type: string }
+        schemeName: { type: string }
+        units: { type: number }
+        investedAmount: { type: number }
+        currentValue: { type: number }
+        absoluteReturn: { type: number }
+        percentReturn: { type: number }
+        dayChange: { type: number }
+        xirr: { type: number, nullable: true }
+
+    PortfolioSummary:
+      type: object
+      properties:
+        totalInvested: { type: number }
+        currentValue: { type: number }
+        totalPnl: { type: number }
+        totalPnlPercent: { type: number }
+        xirr: { type: number }
+        dayChange: { type: number }
+        holdingsCount: { type: integer }
+
+    Payment:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        amount: { type: number }
+        method: { type: string, enum: [UPI, NET_BANKING, NACH, WALLET] }
+        status: { type: string, enum: [INITIATED, PROCESSING, SUCCESS, FAILED, REFUNDED] }
+        razorpayOrderId: { type: string }
+        razorpayPaymentId: { type: string, nullable: true }
+
+    Notification:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        type: { type: string }
+        title: { type: string }
+        body: { type: string }
+        isRead: { type: boolean }
+        createdAt: { type: string, format: date-time }
+
+    Pagination:
+      type: object
+      properties:
+        page: { type: integer }
+        limit: { type: integer }
+        total: { type: integer }
+        totalPages: { type: integer }
+
+    Error:
+      type: object
+      properties:
+        success: { type: boolean, example: false }
+        error:
+          type: object
+          properties:
+            message: { type: string }
+            code: { type: string }
+
+  responses:
+    Unauthorized:
+      description: Missing or invalid JWT token
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { success: false, error: { message: "Invalid or expired token", code: "AUTH_INVALID_TOKEN" } }
+    RateLimited:
+      description: Too many requests
+      headers:
+        Retry-After: { schema: { type: integer }, description: "Seconds until rate limit resets" }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { success: false, error: { message: "Too many requests", code: "RATE_LIMIT_EXCEEDED" } }
+    KycRequired:
+      description: Full KYC required before this action
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { success: false, error: { message: "KYC verification must be completed before placing orders", code: "KYC_REQUIRED" } }
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# AUTH ENDPOINTS
+# ═══════════════════════════════════════════════════════════════════════════════
+paths:
+  /auth/send-otp:
+    post:
+      tags: [Auth]
+      summary: Send OTP to mobile number
+      description: |
+        Sends a 6-digit OTP to the given Indian mobile number.
+        Rate limited to 5 requests/minute per IP (OWASP brute-force protection).
+        OTP expires after 5 minutes. For dev mode, OTP is returned in the response.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [mobile]
+              properties:
+                mobile:
+                  type: string
+                  pattern: '^\+91[6-9]\d{9}$'
+                  example: "+919876543210"
+      responses:
+        '200':
+          description: OTP sent successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  data:
+                    type: object
+                    properties:
+                      message: { type: string }
+                      expiresIn: { type: integer, example: 300 }
+                      otp: { type: string, description: "Only in dev mode" }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /auth/verify-otp:
+    post:
+      tags: [Auth]
+      summary: Verify OTP and get JWT tokens
+      description: |
+        Verifies the OTP and returns JWT access + refresh tokens.
+        Creates a new user if the mobile number hasn't been seen before.
+        Access token expires in 15 minutes, refresh token in 7 days.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [mobile, otp]
+              properties:
+                mobile: { type: string, example: "+919876543210" }
+                otp: { type: string, minLength: 6, maxLength: 6, example: "123456" }
+      responses:
+        '200':
+          description: Login successful
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: object
+                    properties:
+                      accessToken: { type: string }
+                      refreshToken: { type: string }
+                      expiresIn: { type: integer, example: 900 }
+                      isNewUser: { type: boolean }
+                      user: { $ref: '#/components/schemas/User' }
+        '400':
+          description: Invalid or expired OTP
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /auth/refresh:
+    post:
+      tags: [Auth]
+      summary: Refresh access token
+      description: |
+        Rotates the refresh token and issues a new access token.
+        Previous refresh token is revoked to prevent replay attacks.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [refreshToken]
+              properties:
+                refreshToken: { type: string }
+      responses:
+        '200':
+          description: Token refreshed
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /auth/profile:
+    get:
+      tags: [Auth]
+      summary: Get current user profile
+      security: [{ BearerAuth: [] }]
+      responses:
+        '200':
+          description: User profile
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data: { $ref: '#/components/schemas/User' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /auth/logout:
+    post:
+      tags: [Auth]
+      summary: Logout and revoke refresh token
+      security: [{ BearerAuth: [] }]
+      responses:
+        '200':
+          description: Logged out
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# KYC ENDPOINTS
+# ═══════════════════════════════════════════════════════════════════════════════
+  /kyc/status:
+    get:
+      tags: [KYC]
+      summary: Get KYC verification status
+      security: [{ BearerAuth: [] }]
+      responses:
+        '200':
+          description: KYC status with step-by-step breakdown
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: object
+                    properties:
+                      kycStatus: { type: string }
+                      panVerified: { type: boolean }
+                      aadhaarVerified: { type: boolean }
+                      videoKycStatus: { type: string }
+                      kycExpiresAt: { type: string, format: date-time, nullable: true }
+
+  /kyc/verify-pan:
+    post:
+      tags: [KYC]
+      summary: Verify PAN number
+      description: |
+        Validates PAN format (ABCDE1234F) and verifies against NSDL/CDSL records.
+        SEBI KYC norms: PAN is mandatory for all financial transactions.
+        PAN number is encrypted (AES-256-GCM) before storage.
+      security: [{ BearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [panNumber]
+              properties:
+                panNumber:
+                  type: string
+                  pattern: '^[A-Z]{5}[0-9]{4}[A-Z]$'
+                  example: "ABCDE1234F"
+                fullName:
+                  type: string
+                  description: "Name as on PAN for cross-verification"
+      responses:
+        '200':
+          description: PAN verified or already verified
+        '400':
+          description: Invalid PAN format
+        '422':
+          description: PAN verification failed (name mismatch, invalid PAN)
+
+  /kyc/verify-aadhaar:
+    post:
+      tags: [KYC]
+      summary: Verify Aadhaar via DigiLocker
+      description: |
+        Initiates Aadhaar verification via DigiLocker API.
+        Aadhaar XML is fetched and address/name verified.
+        Number is encrypted at rest and masked in all responses.
+      security: [{ BearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [aadhaarNumber]
+              properties:
+                aadhaarNumber:
+                  type: string
+                  pattern: '^\d{12}$'
+                  example: "123456789012"
+      responses:
+        '200':
+          description: Aadhaar verified
+        '422':
+          description: Aadhaar verification failed
+
+  /kyc/video-kyc:
+    post:
+      tags: [KYC]
+      summary: Submit video KYC recording
+      description: |
+        Accepts a video KYC recording URL (uploaded to S3).
+        SEBI Video KYC guidelines: user must show PAN card and state details.
+        Video undergoes AI + manual review.
+      security: [{ BearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [videoUrl]
+              properties:
+                videoUrl: { type: string, format: uri }
+                latitude: { type: number }
+                longitude: { type: number }
+      responses:
+        '200':
+          description: Video submitted for review
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# FUND ENDPOINTS
+# ═══════════════════════════════════════════════════════════════════════════════
+  /funds:
+    get:
+      tags: [Funds]
+      summary: Browse mutual funds
+      description: Browse and filter available mutual funds with pagination.
+      parameters:
+        - name: page
+          in: query
+          schema: { type: integer, default: 1 }
+        - name: limit
+          in: query
+          schema: { type: integer, default: 20, maximum: 100 }
+        - name: category
+          in: query
+          schema: { type: string }
+          description: Filter by AMFI category
+        - name: riskLevel
+          in: query
+          schema: { type: string, enum: [LOW, MODERATE, HIGH, VERY_HIGH] }
+        - name: search
+          in: query
+          schema: { type: string }
+          description: Search by scheme name or fund house
+        - name: sortBy
+          in: query
+          schema: { type: string, enum: [return1y, return3y, return5y, aum, nav, expenseRatio] }
+          description: Sort field
+        - name: sortOrder
+          in: query
+          schema: { type: string, enum: [asc, desc], default: desc }
+      responses:
+        '200':
+          description: Paginated list of funds
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: object
+                    properties:
+                      funds:
+                        type: array
+                        items: { $ref: '#/components/schemas/Fund' }
+                      pagination: { $ref: '#/components/schemas/Pagination' }
+
+  /funds/{fundId}:
+    get:
+      tags: [Funds]
+      summary: Get fund details with NAV history
+      parameters:
+        - name: fundId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+        - name: navPeriod
+          in: query
+          schema: { type: string, enum: [1M, 3M, 6M, 1Y, 3Y, 5Y, ALL], default: 1Y }
+      responses:
+        '200':
+          description: Fund details with NAV history
+        '404':
+          description: Fund not found
+
+  /funds/sip:
+    get:
+      tags: [Funds]
+      summary: List user's SIP plans
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - name: status
+          in: query
+          schema: { type: string, enum: [ACTIVE, PAUSED, COMPLETED, CANCELLED] }
+      responses:
+        '200':
+          description: List of SIP plans
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/SipPlan' }
+    post:
+      tags: [Funds]
+      summary: Create a new SIP
+      description: |
+        Creates a new Systematic Investment Plan. Requires full KYC.
+        SIP dates are restricted to 1st, 5th, 10th, 15th, 20th, 25th of each month.
+        NACH mandate registration is initiated for auto-debit.
+      security: [{ BearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [fundId, amount, sipDate]
+              properties:
+                fundId: { type: string, format: uuid }
+                amount: { type: number, minimum: 100, description: "Must be >= fund's minSipAmount" }
+                sipDate: { type: integer, minimum: 1, maximum: 28 }
+                frequency: { type: string, enum: [MONTHLY, WEEKLY, QUARTERLY], default: MONTHLY }
+                totalInstallments: { type: integer, nullable: true }
+      responses:
+        '201':
+          description: SIP created
+        '400':
+          description: Validation error (amount below minimum, invalid date)
+        '403': { $ref: '#/components/responses/KycRequired' }
+
+  /funds/sip/{sipId}:
+    put:
+      tags: [Funds]
+      summary: Modify SIP (pause, resume, change amount)
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - name: sipId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                action: { type: string, enum: [PAUSE, RESUME, CANCEL] }
+                amount: { type: number, description: "New SIP amount" }
+      responses:
+        '200':
+          description: SIP updated
+    delete:
+      tags: [Funds]
+      summary: Cancel SIP
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - name: sipId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: SIP cancelled
+
+  /funds/purchase:
+    post:
+      tags: [Funds]
+      summary: Place a lumpsum purchase order
+      description: |
+        Places a one-time mutual fund purchase order.
+        Requires Idempotency-Key header to prevent duplicate orders on retry.
+        KYC must be APPROVED. Payment is initiated via Razorpay.
+        Stamp duty of 0.005% is added (SEBI mandate since Jul 2020).
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema: { type: string, format: uuid }
+          description: Unique key per order request to ensure idempotent processing
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [fundId, amount]
+              properties:
+                fundId: { type: string, format: uuid }
+                amount: { type: number, minimum: 100 }
+                paymentMethod: { type: string, enum: [UPI, NET_BANKING], default: UPI }
+      responses:
+        '201':
+          description: Order placed successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: object
+                    properties:
+                      order: { $ref: '#/components/schemas/Order' }
+                      payment: { $ref: '#/components/schemas/Payment' }
+          headers:
+            X-Idempotent-Replayed:
+              schema: { type: boolean }
+              description: "true if this is a replay of a previous request"
+        '400':
+          description: Validation error
+        '403': { $ref: '#/components/responses/KycRequired' }
+        '409':
+          description: Duplicate order (idempotency key already used)
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503':
+          description: BSE StarMF circuit breaker open
+
+  /funds/orders:
+    get:
+      tags: [Funds]
+      summary: List user's orders
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - name: status
+          in: query
+          schema: { type: string }
+        - name: fundId
+          in: query
+          schema: { type: string, format: uuid }
+        - name: page
+          in: query
+          schema: { type: integer, default: 1 }
+        - name: limit
+          in: query
+          schema: { type: integer, default: 20 }
+      responses:
+        '200':
+          description: Paginated order history
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PORTFOLIO ENDPOINTS
+# ═══════════════════════════════════════════════════════════════════════════════
+  /portfolio/holdings:
+    get:
+      tags: [Portfolio]
+      summary: Get user's current holdings
+      description: |
+        Returns all mutual fund holdings with current values, P&L, and day change.
+        Values are cached and refreshed every 15 minutes during market hours (9:15 AM - 3:30 PM IST).
+      security: [{ BearerAuth: [] }]
+      responses:
+        '200':
+          description: Holdings list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/Holding' }
+
+  /portfolio/summary:
+    get:
+      tags: [Portfolio]
+      summary: Get portfolio summary with XIRR
+      description: |
+        Aggregated portfolio summary including total invested, current value,
+        P&L, XIRR (annualized return using Newton-Raphson method), and day change.
+      security: [{ BearerAuth: [] }]
+      responses:
+        '200':
+          description: Portfolio summary
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data: { $ref: '#/components/schemas/PortfolioSummary' }
+
+  /portfolio/allocation:
+    get:
+      tags: [Portfolio]
+      summary: Get asset allocation breakdown
+      security: [{ BearerAuth: [] }]
+      responses:
+        '200':
+          description: Allocation by category
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        category: { type: string }
+                        value: { type: number }
+                        percentage: { type: number }
+
+  /portfolio/transactions:
+    get:
+      tags: [Portfolio]
+      summary: Get transaction history
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - name: fundId
+          in: query
+          schema: { type: string }
+        - name: type
+          in: query
+          schema: { type: string, enum: [BUY, SELL, DIVIDEND] }
+        - name: from
+          in: query
+          schema: { type: string, format: date }
+        - name: to
+          in: query
+          schema: { type: string, format: date }
+      responses:
+        '200':
+          description: Transaction history
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PAYMENT ENDPOINTS
+# ═══════════════════════════════════════════════════════════════════════════════
+  /payments/initiate:
+    post:
+      tags: [Payments]
+      summary: Initiate payment for an order
+      description: |
+        Creates a Razorpay order and returns payment details for client-side SDK.
+        Idempotency-Key required to prevent duplicate payments.
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [orderId, amount, method]
+              properties:
+                orderId: { type: string, format: uuid }
+                amount: { type: number }
+                method: { type: string, enum: [UPI, NET_BANKING] }
+      responses:
+        '200':
+          description: Payment initiated
+        '503':
+          description: Razorpay circuit breaker open
+
+  /payments/verify:
+    post:
+      tags: [Payments]
+      summary: Verify payment after Razorpay callback
+      description: |
+        Verifies the Razorpay payment signature (HMAC SHA-256).
+        On success, the linked order status is updated to SUBMITTED.
+      security: [{ BearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [razorpayPaymentId, razorpayOrderId, razorpaySignature]
+              properties:
+                razorpayPaymentId: { type: string }
+                razorpayOrderId: { type: string }
+                razorpaySignature: { type: string }
+      responses:
+        '200':
+          description: Payment verified
+        '400':
+          description: Invalid signature
+
+  /payments/history:
+    get:
+      tags: [Payments]
+      summary: Get payment history
+      security: [{ BearerAuth: [] }]
+      responses:
+        '200':
+          description: Payment history
+
+  /payments/bank-accounts:
+    get:
+      tags: [Payments]
+      summary: Get linked bank accounts
+      security: [{ BearerAuth: [] }]
+      responses:
+        '200':
+          description: List of linked bank accounts
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# WATCHLIST & DISCOVERY ENDPOINTS
+# ═══════════════════════════════════════════════════════════════════════════════
+  /watchlist:
+    get:
+      tags: [Watchlist]
+      summary: Get user's watchlist
+      security: [{ BearerAuth: [] }]
+      responses:
+        '200':
+          description: Watchlist items with current prices
+    post:
+      tags: [Watchlist]
+      summary: Add asset to watchlist
+      security: [{ BearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [assetType, assetCode, assetName]
+              properties:
+                assetType: { type: string, enum: [MUTUAL_FUND, STOCK, ETF] }
+                assetCode: { type: string }
+                assetName: { type: string }
+                fundId: { type: string, format: uuid, nullable: true }
+      responses:
+        '201':
+          description: Added to watchlist
+        '409':
+          description: Already in watchlist
+
+  /watchlist/{id}:
+    delete:
+      tags: [Watchlist]
+      summary: Remove from watchlist
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Removed
+
+  /watchlist/alerts:
+    get:
+      tags: [Watchlist]
+      summary: Get price alerts
+      security: [{ BearerAuth: [] }]
+      responses:
+        '200':
+          description: Price alerts
+    post:
+      tags: [Watchlist]
+      summary: Create price alert
+      security: [{ BearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [assetCode, assetName, targetPrice, condition]
+              properties:
+                assetCode: { type: string }
+                assetName: { type: string }
+                targetPrice: { type: number }
+                condition: { type: string, enum: [ABOVE, BELOW] }
+      responses:
+        '201':
+          description: Alert created
+
+  /discover/search:
+    get:
+      tags: [Watchlist]
+      summary: Search stocks and mutual funds
+      parameters:
+        - name: q
+          in: query
+          required: true
+          schema: { type: string, minLength: 2 }
+        - name: type
+          in: query
+          schema: { type: string, enum: [MUTUAL_FUND, STOCK, ETF, ALL] }
+      responses:
+        '200':
+          description: Search results
+
+  /discover/trending:
+    get:
+      tags: [Watchlist]
+      summary: Get trending assets
+      responses:
+        '200':
+          description: Trending funds and stocks
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# NOTIFICATION ENDPOINTS
+# ═══════════════════════════════════════════════════════════════════════════════
+  /notifications:
+    get:
+      tags: [Notifications]
+      summary: Get user's notifications
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - name: unread
+          in: query
+          schema: { type: boolean }
+        - name: type
+          in: query
+          schema: { type: string }
+        - name: page
+          in: query
+          schema: { type: integer, default: 1 }
+        - name: limit
+          in: query
+          schema: { type: integer, default: 20 }
+      responses:
+        '200':
+          description: Paginated notifications
+
+  /notifications/{id}/read:
+    put:
+      tags: [Notifications]
+      summary: Mark notification as read
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Marked as read
+
+  /notifications/read-all:
+    put:
+      tags: [Notifications]
+      summary: Mark all notifications as read
+      security: [{ BearerAuth: [] }]
+      responses:
+        '200':
+          description: All marked as read
+
+  /notifications/preferences:
+    get:
+      tags: [Notifications]
+      summary: Get notification delivery preferences
+      security: [{ BearerAuth: [] }]
+      responses:
+        '200':
+          description: Preferences per channel
+    put:
+      tags: [Notifications]
+      summary: Update notification preferences
+      security: [{ BearerAuth: [] }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                push: { type: boolean }
+                sms: { type: boolean }
+                email: { type: boolean }
+      responses:
+        '200':
+          description: Preferences updated
